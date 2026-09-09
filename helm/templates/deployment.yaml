@@ -1,0 +1,136 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "busabase.fullname" . }}
+  labels:
+    {{- include "busabase.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.app.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "busabase.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: app
+  template:
+    metadata:
+      labels:
+        {{- include "busabase.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: app
+      {{- with .Values.app.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: app
+          image: "{{ .Values.image.repository }}:{{ required "image.tag is required — pin a version rather than tracking a moving tag" .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            - name: HOSTNAME
+              value: "0.0.0.0"
+            {{/*
+              BUSABASE_EDITION is deliberately absent. The edition is compiled
+              into the image; setting it here would change nothing and would
+              wrongly suggest a deployment can pick its own edition.
+            */}}
+            - name: APP_URL
+              value: {{ required "appUrl is required — sign-in cookies are issued against it, and a mismatch bounces users back to the login page with no error" .Values.appUrl | quote }}
+            - name: BETTER_AUTH_BASE_URL
+              value: {{ .Values.appUrl | quote }}
+            - name: NEXT_PUBLIC_APP_URL
+              value: {{ .Values.appUrl | quote }}
+            - name: NEXT_PUBLIC_SITE_URL
+              value: {{ .Values.appUrl | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "busabase.secretName" . }}
+                  key: POSTGRES_PASSWORD
+            - name: PG_DATABASE_URL
+              value: "postgresql://{{ .Values.postgres.username }}:$(POSTGRES_PASSWORD)@{{ include "busabase.postgresHost" . }}:{{ .Values.postgres.external.port | default 5432 }}/{{ .Values.postgres.database }}"
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "busabase.secretName" . }}
+                  key: S3_ACCESS_KEY
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "busabase.secretName" . }}
+                  key: S3_SECRET_KEY
+            {{/*
+              Addressed by the PUBLIC host, not the in-cluster Service. This URL
+              is handed to the browser for presigned uploads and redirects, and
+              a Service name is not resolvable there — the failure is uploads
+              only, while everything else looks healthy.
+
+              The pod itself can't reach that public host either (an ingress
+              hostname, or a bare `localhost` during port-forward testing, both
+              resolve to something other than the storage Service from inside
+              the pod) — `internal_endpoint` below is where the app actually
+              connects for admin/data calls; `storageHost` stays purely for the
+              signature the browser's request must match. See
+              `busabase.storageInternalEndpoint`'s comment for the failure this
+              fixes.
+            */}}
+            {{- $internalEndpoint := include "busabase.storageInternalEndpoint" . }}
+            - name: STORAGE_URL
+              value: "minio://$(S3_ACCESS_KEY):$(S3_SECRET_KEY)@{{ include "busabase.storageHost" . }}:{{ .Values.storage.publicPort }}/{{ .Values.storage.external.bucket | default "busabase" }}?auto_create=true&ssl=false{{ if $internalEndpoint }}&internal_endpoint={{ $internalEndpoint | urlquery }}{{ end }}"
+            - name: BETTER_AUTH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "busabase.secretName" . }}
+                  key: BETTER_AUTH_SECRET
+            {{- with .Values.app.systemAdminEmail }}
+            - name: SYSTEM_ADMIN_EMAIL
+              value: {{ . | quote }}
+            {{- end }}
+            {{/*
+              An embedded LMDB cache, as in Compose. A separate Redis buys
+              nothing at this scale, and Redis 7.4+ is RSALv2/SSPL, which
+              carries redistribution constraints we would rather not pass on.
+            */}}
+            - name: REDIS_URL
+              value: "lmdb:///data/cache"
+          volumeMounts:
+            - name: cache
+              mountPath: /data
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.app.resources | nindent 12 }}
+      volumes:
+        # Cache only — everything durable lives in Postgres and object storage,
+        # so this is emptyDir and a rescheduled pod simply warms it again.
+        - name: cache
+          emptyDir: {}
+      {{- with .Values.app.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.app.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.app.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

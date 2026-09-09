@@ -1,0 +1,104 @@
+# Busabase Premium — Helm values.
+#
+# The Compose deployment is the reference; everything here maps to something
+# there, including the two constraints that are easy to get wrong and produce
+# failures that look like something else entirely. Both are called out below.
+
+image:
+  # Public on Docker Hub — pullable without a registry token. Mirror it into
+  # your own registry and point this at that instead if your cluster cannot
+  # reach Docker Hub.
+  repository: busabase/busabase-premium
+  # No default tag. A chart that silently deploys `latest` upgrades an instance
+  # whenever the pod restarts, which is not a property anyone asked for on a
+  # server holding their data. Set it explicitly.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# ── The address users type ───────────────────────────────────────────────────
+# Sign-in cookies are issued against this. If it does not match what the browser
+# shows — scheme, host or port — signing in appears to succeed and then bounces
+# straight back to the login page, with nothing in the logs to say why.
+appUrl: ""
+
+# ── Object storage ───────────────────────────────────────────────────────────
+# Uploads are presigned PUTs and downloads are redirects, so the BROWSER fetches
+# storage directly, exactly as it does against S3 on Busabase Cloud. The address
+# below is handed to the browser and must resolve for it. A cluster-internal
+# Service name does not, and the symptom is specific: the app works, sign-in
+# works, and every attachment upload fails.
+storage:
+  # Leave empty to reuse appUrl's host. Set when storage is served from a
+  # different hostname than the app.
+  publicHost: ""
+  publicPort: 8333
+  # `bundled` runs SeaweedFS in the cluster (the Compose default). `external`
+  # points at an S3 you already operate — the better option at any real scale,
+  # and the one that avoids the reachability question entirely.
+  mode: bundled
+  external:
+    # Only read when mode=external. Full URL, e.g. https://s3.company.com
+    endpoint: ""
+    bucket: busabase
+    existingSecret: ""
+
+# ── Database ─────────────────────────────────────────────────────────────────
+postgres:
+  # `bundled` runs a single Postgres pod with a PVC. It is the quickest way to
+  # stand the product up, and it is NOT a managed database: no failover, no
+  # point-in-time recovery, backups are yours. Use `external` in production.
+  mode: bundled
+  image: postgres:16
+  database: busabase
+  username: busabase
+  storage: 20Gi
+  storageClassName: ""
+  external:
+    # Only read when mode=external.
+    host: ""
+    port: 5432
+    existingSecret: ""
+
+# ── Secrets ──────────────────────────────────────────────────────────────────
+# Generated into a Secret on first install when left empty, and preserved across
+# upgrades — regenerating BETTER_AUTH_SECRET signs everyone out, and
+# regenerating the Postgres password locks the app out of its own data.
+#
+# Set `existingSecret` to manage them yourself; the chart then creates none.
+secrets:
+  existingSecret: ""
+  postgresPassword: ""
+  s3AccessKey: busabase
+  s3SecretKey: ""
+  betterAuthSecret: ""
+
+app:
+  replicaCount: 1
+  systemAdminEmail: ""
+  resources:
+    requests:
+      cpu: 500m
+      # 548 MiB measured idle on the all-in-one image; this leaves room for
+      # concurrent uploads and Postgres-side work rather than quoting the floor.
+      memory: 1Gi
+    limits:
+      memory: 2Gi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+
+service:
+  type: ClusterIP
+  port: 3000
+
+# Storage needs to be reachable by the browser too, so if you terminate TLS at
+# an Ingress, both hosts belong behind it.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""
+  storageHost: ""
+  tls: []

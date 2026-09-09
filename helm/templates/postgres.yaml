@@ -1,0 +1,107 @@
+{{- if eq .Values.postgres.mode "bundled" }}
+{{/*
+A single Postgres with a PVC — the quickest way to stand the product up, and
+explicitly not a managed database: one replica, no failover, no PITR, and
+backups are the operator's job. `postgres.mode: external` is the production
+answer. Kept because "install the chart and it works" is worth having.
+
+Also a pre-install/pre-upgrade hook, deliberately. The migrate Job (also a
+hook, weight -5) needs Postgres to already be a real, ready object — hooks run
+BEFORE a release's normal resources are created at all, so if Postgres were a
+normal resource, migrate would fail with a DNS lookup error against a Service
+that does not exist yet. Found by actually installing the chart: `getaddrinfo
+ENOTFOUND` naming this Service, not by rendering the templates, which never
+checks creation order between hooks and normal resources.
+
+No `hook-delete-policy` is set — unlike the migrate Job, this has to keep
+running rather than being torn down after the hook phase.
+
+That does NOT mean the pod survives an upgrade untouched, though: a real
+`helm upgrade` (not just `helm template`) restarts this pod every time,
+because Helm re-applies pre-install/pre-upgrade hooks on every release rather
+than skipping ones with no spec diff. What actually matters — and what's
+verified by that same upgrade — is that the PVC (and the data on it) is not
+affected: `volumeClaimTemplates` PVCs outlive the pod/StatefulSet that
+created them, so Postgres comes back up against the same disk. Expect a
+short connection interruption on every `helm upgrade`, not zero-downtime.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "busabase.fullname" . }}-postgres
+  labels:
+    {{- include "busabase.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-15"
+spec:
+  ports:
+    - port: 5432
+      targetPort: postgres
+      name: postgres
+  selector:
+    {{- include "busabase.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "busabase.fullname" . }}-postgres
+  labels:
+    {{- include "busabase.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-15"
+spec:
+  serviceName: {{ include "busabase.fullname" . }}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "busabase.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: postgres
+  template:
+    metadata:
+      labels:
+        {{- include "busabase.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.image | quote }}
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: {{ .Values.postgres.username | quote }}
+            - name: POSTGRES_DB
+              value: {{ .Values.postgres.database | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "busabase.secretName" . }}
+                  key: POSTGRES_PASSWORD
+            # The image only initialises a fresh cluster when PGDATA is empty;
+            # a subdirectory keeps it clear of the volume's lost+found.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.postgres.username | quote }}]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.postgres.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.postgres.storage }}
+{{- end }}

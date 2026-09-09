@@ -1,0 +1,86 @@
+{{/*
+Migrations as a Helm hook, which is the Kubernetes equivalent of Compose's
+one-shot `migrate` service plus `condition: service_completed_successfully`.
+
+Two properties matter and both come from being a hook rather than an initContainer:
+
+  - It runs ONCE per release, not once per replica. An initContainer would have
+    every replica race to migrate the same database on startup; the loser fails
+    in a way that reads as a corrupt schema rather than a lock conflict.
+  - A failed migration FAILS THE RELEASE. `helm upgrade` stops and the existing
+    pods keep serving the old code against the old schema, instead of new pods
+    coming up against a half-migrated one.
+
+`hook-delete-policy` keeps the failed Job around so its logs can be read; the
+error names the failing SQL statement, though not the file it came from —
+grep the migrations directory for that statement to find it.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "busabase.fullname" . }}-migrate
+  labels:
+    {{- include "busabase.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        {{- include "busabase.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{/*
+        Waits for a real, accepting-connections Postgres, not just a resolvable
+        one. Hook weight ordering (this Job at -5, the bundled Postgres
+        StatefulSet at -15) guarantees Postgres exists as a Kubernetes object
+        before this runs — Helm creates hooks in weight order — but does NOT
+        wait for a StatefulSet hook to reach Ready before moving to the next
+        weight the way it does for a completed Job. Found by actually
+        installing the chart: the DNS-not-found error from before was gone, but
+        it was replaced by ECONNREFUSED — the Postgres pod object existed and
+        had an IP, but the container was still `ContainerCreating`.
+      */}}
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until nc -z {{ include "busabase.postgresHost" . }} {{ .Values.postgres.external.port | default 5432 }}; do
+                echo "waiting for postgres..."; sleep 2
+              done
+      containers:
+        - name: migrate
+          image: "{{ .Values.image.repository }}:{{ required "image.tag is required — pin a version rather than tracking a moving tag" .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - cd /app/apps/busabase-cloud && node_modules/.bin/drizzle-kit migrate
+          env:
+            {{/*
+              POSTGRES_PASSWORD MUST come before PG_DATABASE_URL. Kubernetes'
+              $(VAR) env interpolation only resolves references to variables
+              defined EARLIER in the same container's env list — reversed, as
+              this originally was, $(POSTGRES_PASSWORD) is left as that literal
+              8-character string in the connection URL instead of the real
+              password, and Postgres refuses it with "password authentication
+              failed". Confirmed on a live cluster by reading the env value
+              straight out of the running pod; no renderer or linter catches
+              this, because the YAML and the template are both entirely valid.
+            */}}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "busabase.secretName" . }}
+                  key: POSTGRES_PASSWORD
+            - name: PG_DATABASE_URL
+              value: "postgresql://{{ .Values.postgres.username }}:$(POSTGRES_PASSWORD)@{{ include "busabase.postgresHost" . }}:{{ .Values.postgres.external.port | default 5432 }}/{{ .Values.postgres.database }}"

@@ -1,0 +1,146 @@
+{{- if eq .Values.storage.mode "bundled" }}
+{{/*
+Bundled object storage.
+
+Two settings here are load-bearing and both were learned by things breaking:
+
+  - No `-ip` flag. Passing one stops the master's gRPC listener (HTTP port +
+    10000) from binding, after which the volume server never registers and S3
+    never becomes usable — while the process looks perfectly alive.
+  - An `anonymous` READ identity, scoped to the bucket. An attachment's public
+    URL is embedded in document content and fetched by a browser holding no
+    credentials; without this, uploads succeed and every image renders as 403.
+    `List` is not granted, so the bucket cannot be enumerated. `Read:bucket` is
+    the narrowest grant that works — SeaweedFS 3.80 ignores `Read:bucket/prefix`.
+*/}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "busabase.fullname" . }}-s3-config
+  labels:
+    {{- include "busabase.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-16"
+type: Opaque
+stringData:
+  s3.json: |
+    {
+      "identities": [
+        {
+          "name": "{{ .Values.secrets.s3AccessKey }}",
+          "credentials": [{ "accessKey": "{{ .Values.secrets.s3AccessKey }}", "secretKey": "__S3_SECRET__" }],
+          "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+        },
+        {
+          "name": "anonymous",
+          "actions": ["Read:{{ .Values.storage.external.bucket | default "busabase" }}"]
+        }
+      ]
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "busabase.fullname" . }}-storage
+  labels:
+    {{- include "busabase.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-15"
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.storage.publicPort }}
+      targetPort: s3
+      name: s3
+  selector:
+    {{- include "busabase.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: storage
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "busabase.fullname" . }}-storage
+  labels:
+    {{- include "busabase.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-15"
+spec:
+  serviceName: {{ include "busabase.fullname" . }}-storage
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "busabase.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: storage
+  template:
+    metadata:
+      labels:
+        {{- include "busabase.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: storage
+    spec:
+      initContainers:
+        # The secret key cannot be templated into the config Secret without
+        # writing it there in plaintext for anyone with get-secret on the wrong
+        # object. It is substituted at start-up from the app's own Secret.
+        - name: render-s3-config
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - sed "s|__S3_SECRET__|${S3_SECRET_KEY}|" /config-template/s3.json > /config/s3.json
+          env:
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "busabase.secretName" . }}
+                  key: S3_SECRET_KEY
+          volumeMounts:
+            - name: config-template
+              mountPath: /config-template
+            - name: config
+              mountPath: /config
+      containers:
+        - name: seaweedfs
+          image: chrislusf/seaweedfs:3.80
+          args:
+            - server
+            - -dir=/data
+            - -filer
+            - -s3
+            - -s3.port=8333
+            - -s3.config=/config/s3.json
+          ports:
+            - name: s3
+              containerPort: 8333
+            - name: master
+              containerPort: 9333
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /config
+          readinessProbe:
+            httpGet:
+              path: /cluster/status
+              port: 9333
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: config-template
+          secret:
+            secretName: {{ include "busabase.fullname" . }}-s3-config
+        - name: config
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.postgres.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.postgres.storage }}
+{{- end }}

@@ -1,0 +1,18 @@
+apiVersion: v2
+name: busabase-premium
+description: Busabase Premium — the self-hosted, licensed edition of Busabase
+type: application
+# Chart version moves with the chart's own shape. appVersion is left unset on
+# purpose: the image tag is chosen per install (values.image.tag), and a stale
+# appVersion here would be a second, quietly-wrong answer to "what is deployed".
+version: 0.1.0
+home: https://busabase.com/self-hosted/install
+sources:
+  - https://github.com/busabase/busabase
+maintainers:
+  - name: Busabase
+    email: support@busabase.com
+keywords:
+  - busabase
+  - self-hosted
+  - approval-first

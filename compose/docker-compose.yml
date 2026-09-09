@@ -1,0 +1,150 @@
+# Busabase Premium — production deployment (SKU D)
+#
+# Separate services instead of the all-in-one image (SKU C), for deployments
+# that outgrow a single container: Postgres and object storage can be backed up,
+# tuned and scaled independently, and the app can be restarted without taking
+# the database down with it.
+#
+# Quick start:
+#   cp .env.example .env      # then edit: set the secrets
+#   docker compose up -d
+#
+# Upgrading:
+#   docker compose pull && docker compose up -d
+#   (the `migrate` service runs first and gates the app — see below)
+#
+# Everything here avoids Compose-only constructs on purpose. Config arrives via
+# environment variables rather than Compose interpolation, and startup ordering
+# is expressed through healthchecks rather than assumed, so translating this to
+# a Helm chart later is mechanical rather than a redesign.
+
+name: busabase-premium
+
+services:
+  postgres:
+    image: ${IMAGE_REGISTRY:-docker.io}/postgres:16
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-busabase}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # Not published to the host: only the app and the migration job need it.
+    # Expose it deliberately (and firewall it) if an external backup tool must
+    # reach it directly.
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [busabase]
+
+  # S3-compatible object storage. SeaweedFS (Apache 2.0) rather than MinIO,
+  # which is AGPL v3 and stopped publishing prebuilt images in Oct 2025 —
+  # unsuitable to redistribute inside a closed-source commercial product.
+  seaweedfs:
+    image: ${IMAGE_REGISTRY:-docker.io}/chrislusf/seaweedfs:3.80
+    restart: always
+    volumes:
+      - seaweedfs_data:/data
+      - ./seaweed-s3.json:/config/s3.json:ro
+    # No `-ip` flag: it prevents the master's gRPC listener (HTTP port + 10000)
+    # from binding, after which the volume server never registers and S3 never
+    # becomes usable. Found the hard way while building the all-in-one image.
+    command: server -dir=/data -filer -s3 -s3.port=8333 -s3.config=/config/s3.json -master.volumeSizeLimitMB=${SEAWEEDFS_VOLUME_LIMIT_MB:-1024}
+    # 8333 is published, not merely exposed: the browser fetches object storage
+    # directly (presigned PUT for upload, redirect for download), so an address
+    # only reachable inside the compose network breaks every attachment.
+    ports:
+      - "${S3_PORT:-8333}:8333"
+    expose:
+      - "9333"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9333/cluster/status || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [busabase]
+
+  # Migrations run as their own one-shot service rather than inside the app.
+  # With more than one app replica, every replica would otherwise race to
+  # migrate the same database on boot. This runs once, and the app waits for it
+  # to exit successfully — a failed migration therefore stops the rollout
+  # instead of letting a half-migrated schema serve traffic.
+  migrate:
+    image: ${BUSABASE_IMAGE:-busabase/busabase-premium:latest}
+    restart: "no"
+    environment:
+      PG_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-busabase}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - cd /app/apps/busabase-cloud && node_modules/.bin/drizzle-kit migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [busabase]
+
+  app:
+    image: ${BUSABASE_IMAGE:-busabase/busabase-premium:latest}
+    restart: always
+    environment:
+      BUSABASE_EDITION: self-hosted
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+      PG_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-busabase}
+      # `minio://` is our internal provider tag for "S3, path-style, no TLS" —
+      # it describes the protocol, not the vendor, and is correct for SeaweedFS.
+      # Addressed by S3_PUBLIC_URL, not the `seaweedfs` service name: this value
+      # is handed to the browser, which cannot resolve compose-internal DNS.
+      STORAGE_URL: minio://${S3_ACCESS_KEY}:${S3_SECRET_KEY}@${S3_PUBLIC_HOST:-localhost}:${S3_PORT:-8333}/${S3_BUCKET:-busabase}?auto_create=true&ssl=false
+      # Embedded LMDB cache: a separate Redis buys nothing at this scale, and
+      # Redis 7.4+ is RSALv2/SSPL, which carries the same redistribution problem
+      # as MinIO. openlib falls back to in-process pub/sub when REDIS_URL is not
+      # a redis:// URL, which is what a single app replica needs.
+      REDIS_URL: lmdb:///data/cache
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET in .env}
+      BETTER_AUTH_BASE_URL: ${APP_URL:?set APP_URL in .env}
+      NEXT_PUBLIC_APP_URL: ${APP_URL}
+      NEXT_PUBLIC_SITE_URL: ${APP_URL}
+      SYSTEM_ADMIN_EMAIL: ${SYSTEM_ADMIN_EMAIL:-admin@example.com}
+    volumes:
+      - app_cache:/data
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    # S3_PUBLIC_HOST is the one address that has to mean the same thing to two
+    # different machines: the browser fetches storage from it, and this
+    # container signs requests against it. Mapping it to the Docker host makes
+    # the container reach it back through the published port, so a single
+    # hostname stays correct on both sides.
+    #
+    # It must NOT be `localhost` here — inside this container that resolves to
+    # the container itself, not to the seaweedfs service, and every upload fails
+    # with ECONNREFUSED. (The all-in-one image can use localhost precisely
+    # because storage runs in the same container.) init.sh enforces this.
+    extra_hosts:
+      - "${S3_PUBLIC_HOST}:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+    networks: [busabase]
+
+volumes:
+  postgres_data:
+  seaweedfs_data:
+  app_cache:
+
+networks:
+  busabase:

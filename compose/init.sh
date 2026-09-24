@@ -1,28 +1,34 @@
 #!/bin/bash
-# 一次性初始化：生成 .env 与 seaweed-s3.json，密钥随机且两处自动保持一致。
+# One-time setup: writes .env and seaweed-s3.json with random secrets that
+# already agree with each other.
 #
-# 存在的理由是消除一个真实的踩坑点：S3 凭据同时被 .env(应用侧) 和
-# seaweed-s3.json(存储侧) 使用，手工填两遍极易漏改一处，症状是应用启动正常
-# 但所有附件上传失败——排查成本远高于此脚本的价值。
+# This script exists to remove one specific trap. The object-storage
+# credentials are read from two places — .env by the app, seaweed-s3.json by
+# the storage service — and they have to match. Filling both in by hand and
+# missing one is the most common self-inflicted failure here, and its symptom
+# is misleading: the app starts, signs you in, and then every attachment
+# upload fails.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-[ -f .env ] && { echo "❌ .env 已存在，不覆盖。如需重来请先备份并删除。"; exit 1; }
+[ -f .env ] && { echo "❌ .env already exists; not overwriting. Back it up and remove it to start over."; exit 1; }
 
 gen() { openssl rand -hex "${1:-24}"; }
 PG_PW=$(gen 24); S3_KEY="busabase"; S3_SECRET=$(gen 24); AUTH=$(gen 32)
 
-read -rp "访问地址 (如 https://busabase.company.internal): " APP_URL
+read -rp "Address users will visit (e.g. https://busabase.company.internal): " APP_URL
 APP_URL=${APP_URL:-http://localhost:3000}
-read -rp "管理员邮箱: " ADMIN_EMAIL
+read -rp "Administrator email: " ADMIN_EMAIL
 ADMIN_EMAIL=${ADMIN_EMAIL:-admin@example.com}
 
-# 对象存储的对外地址与 APP_URL 同主机。localhost 在 app 容器里指容器自己，
-# 用它签名会让每次上传 ECONNREFUSED，所以这里直接拦下来而不是让它悄悄坏掉。
+# Object storage is published on the same host as APP_URL. Inside the app
+# container, localhost resolves to the container itself, so signing URLs
+# against it makes every upload fail with ECONNREFUSED. Refuse it here rather
+# than letting it break quietly later.
 S3_HOST=$(printf '%s' "$APP_URL" | sed -E 's#^[a-z]+://##; s#[:/].*$##')
 if [ "$S3_HOST" = "localhost" ] || [ "$S3_HOST" = "127.0.0.1" ]; then
-  echo "❌ 访问地址不能用 localhost/127.0.0.1：app 容器会把它解析成自己，附件上传必然失败。"
-  echo "   请填服务器的真实主机名或 IP，例如 https://busabase.company.internal 或 http://192.168.1.10:3000"
+  echo "❌ The address cannot be localhost/127.0.0.1: the app container resolves it to itself, so attachment uploads are guaranteed to fail."
+  echo "   Use the server's real hostname or IP — for example https://busabase.company.internal or http://192.168.1.10:3000"
   exit 1
 fi
 
@@ -36,15 +42,19 @@ sed -e "s|^APP_URL=.*|APP_URL=${APP_URL}|" \
     .env.example > .env
 chmod 600 .env
 
-# 同一对凭据写进存储侧配置，杜绝两处不一致
-# 两个身份：
-#   - 带凭据的那个，应用用它签名读写；
-#   - anonymous 只读，限定在 busabase 这个 bucket 内。
+# The same credentials go into the storage-side config, so the two cannot drift.
 #
-# 为什么需要 anonymous：附件的 publicUrl 会被直接嵌进文档内容交给浏览器，
-# 浏览器手上没有凭据。没有这条，上传能成功而每张图都显示不出来（403）。
-# 这与云版资源桶的姿态一致——安全性来自 key 不可猜（随机 nanoid + 空间 id），
-# 而不是来自"读不到"。不放开 List，所以无法枚举；写入仍然必须签名。
+# Two identities:
+#   - the one with credentials, which the app uses to sign reads and writes;
+#   - `anonymous`, read-only and scoped to the busabase bucket.
+#
+# Why anonymous is needed: an attachment's public URL is embedded directly in
+# document content and fetched by a browser that holds no credentials. Without
+# it, uploads succeed and every image renders as 403.
+# This matches how the hosted product's asset bucket behaves — security comes
+# from keys being unguessable (a random nanoid plus the space id), not from the
+# bucket being unreadable. List is not granted, so nothing can be enumerated,
+# and writes still require a signature.
 cat > seaweed-s3.json <<JSON
 {
   "identities": [
@@ -62,5 +72,5 @@ cat > seaweed-s3.json <<JSON
 JSON
 chmod 600 seaweed-s3.json
 
-echo "✅ 已生成 .env 与 seaweed-s3.json（密钥随机，两处一致）"
-echo "   下一步: docker compose up -d"
+echo "✅ Wrote .env and seaweed-s3.json (random secrets, matching on both sides)"
+echo "   Next: docker compose up -d"

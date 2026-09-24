@@ -1,4 +1,4 @@
-# 由 init.sh 生成，含随机密钥，绝不入库
+# Written by init.sh, contains random secrets — never commit these.
 .env
 seaweed-s3.json
 backups/

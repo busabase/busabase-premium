@@ -54,7 +54,7 @@ services:
     # No `-ip` flag: it prevents the master's gRPC listener (HTTP port + 10000)
     # from binding, after which the volume server never registers and S3 never
     # becomes usable. Found the hard way while building the all-in-one image.
-    command: server -dir=/data -filer -s3 -s3.port=8333 -s3.config=/config/s3.json -master.volumeSizeLimitMB=${SEAWEEDFS_VOLUME_LIMIT_MB:-1024}
+    command: server -dir=/data -filer -s3 -s3.ip=0.0.0.0 -s3.port=8333 -s3.config=/config/s3.json -master.volumeSizeLimitMB=${SEAWEEDFS_VOLUME_LIMIT_MB:-1024}
     # 8333 is published, not merely exposed: the browser fetches object storage
     # directly (presigned PUT for upload, redirect for download), so an address
     # only reachable inside the compose network breaks every attachment.
@@ -90,6 +90,8 @@ services:
   app:
     image: ${BUSABASE_IMAGE:-busabase/busabase-premium:latest}
     restart: always
+    env_file:
+      - .env
     environment:
       BUSABASE_EDITION: self-hosted
       PORT: "3000"
@@ -107,6 +109,11 @@ services:
       REDIS_URL: lmdb:///data/cache
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET in .env}
       BETTER_AUTH_BASE_URL: ${APP_URL:?set APP_URL in .env}
+      # Trust extra origins at once (IP + hostname, domain migration).
+      BETTER_AUTH_ADDITIONAL_ORIGINS: ${BETTER_AUTH_ADDITIONAL_ORIGINS:-}
+      # Self-hosted defaults to no email verification; set to true only with a
+      # working EMAIL_PROVIDER configured.
+      EMAIL_VERIFICATION_REQUIRED: ${EMAIL_VERIFICATION_REQUIRED:-false}
       NEXT_PUBLIC_APP_URL: ${APP_URL}
       NEXT_PUBLIC_SITE_URL: ${APP_URL}
       SYSTEM_ADMIN_EMAIL: ${SYSTEM_ADMIN_EMAIL:-admin@example.com}

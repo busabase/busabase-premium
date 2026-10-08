@@ -17,7 +17,7 @@ docker run -d --name busabase \
   -p 8333:8333 \
   -v busabase-data:/data \
   --restart unless-stopped \
-  busabase/busabase-premium-allinone:trial
+  busabase/busabase-premium-allinone:latest
 ```
 
 ## Quick start
